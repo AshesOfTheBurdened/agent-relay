@@ -122,6 +122,7 @@ wss.on('connection', ws => {
   const id = crypto.randomUUID();
   let name = 'unknown';
   let isExecutor = false;
+  console.log(`[conn] New WebSocket connection: ${id}`);
 
   ws.on('message', raw => {
     try {
