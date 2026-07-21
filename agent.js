@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 const http = require('http');
+const https = require('https');
 const { execSync } = require('child_process');
 const { readFileSync, writeFileSync, existsSync } = require('fs');
 const { readdir } = require('fs/promises');
@@ -118,15 +119,15 @@ const TOOLS = {
 function connect() {
   console.log(`[agent] Connecting to ${RELAY_URL} as "${AGENT_NAME}" (executor)...`);
 
-  const protocol = RELAY_URL.startsWith('wss') ? require('tls') : require('net');
-  let isWss = RELAY_URL.startsWith('wss');
+  const isWss = RELAY_URL.startsWith('wss');
 
   // Parse URL
   const url = new URL(RELAY_URL);
   const port = parseInt(url.port) || (isWss ? 443 : 80);
 
   const key = crypto.randomBytes(16).toString('base64');
-  const req = http.request({
+  const httpMod = isWss ? https : http;
+  const req = httpMod.request({
     hostname: url.hostname,
     port,
     method: 'GET',
@@ -145,8 +146,8 @@ function connect() {
     const accept = res.headers['sec-websocket-accept'];
     if (!accept) { console.error('[agent] No WebSocket accept header'); return; }
 
-    // Send join
-    sendFrame(socket, { type: 'join', name: AGENT_NAME, executor: true });
+    // Send join after short delay
+    setTimeout(() => sendFrame(socket, { type: 'join', name: AGENT_NAME, executor: true }), 200);
 
     let buf = Buffer.alloc(0);
 
@@ -197,11 +198,17 @@ function connect() {
 
 function sendFrame(socket, msg) {
   const data = Buffer.from(JSON.stringify(msg), 'utf8');
-  const h = Buffer.alloc(2);
-  h[0] = 0x80 | 0x01;
-  if (data.length < 126) { h[1] = data.length; socket.write(Buffer.concat([h, data])); }
-  else if (data.length < 65536) { h[1] = 126; const e = Buffer.alloc(2); e.writeUInt16BE(data.length); socket.write(Buffer.concat([h, e, data])); }
-  else { h[1] = 127; const e = Buffer.alloc(8); e.writeBigUInt64BE(BigInt(data.length)); socket.write(Buffer.concat([h, e, data])); }
+  const mask = crypto.randomBytes(4);
+  for (let i = 0; i < data.length; i++) data[i] ^= mask[i % 4];
+  const h = Buffer.alloc(data.length < 126 ? 6 : data.length < 65536 ? 8 : 14);
+  h[0] = 0x81;
+  let off = 2;
+  if (data.length < 126) { h[1] = 0x80 | data.length; }
+  else if (data.length < 65536) { h[1] = 0x80 | 126; h.writeUInt16BE(data.length, 2); off = 4; }
+  else { h[1] = 0x80 | 127; h.writeBigUInt64BE(BigInt(data.length), 2); off = 10; }
+  mask.copy(h, off);
+  off += 4;
+  socket.write(Buffer.concat([h.slice(0, off), data]));
 }
 
 function sendRaw(socket, op, payload) {
