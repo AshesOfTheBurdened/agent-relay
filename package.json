@@ -1,0 +1,1 @@
+{"name":"agent-relay","version":"1.0.0","description":"WebSocket relay for multi-agent AI communication","main":"server.js","scripts":{"start":"node server.js"},"license":"MIT"}
