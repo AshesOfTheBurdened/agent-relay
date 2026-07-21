@@ -1,0 +1,1 @@
+{"name":"Agent Relay","postStartCommand":"node /workspaces/agent-relay/server.js","forwardPorts":[8080]}
