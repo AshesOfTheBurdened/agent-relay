@@ -62,16 +62,24 @@ class WSClient extends EventEmitter {
 
 // ── Relay Server ──────────────────────────────────────────────────
 
+function sendTo(name, msg) {
+  const data = JSON.stringify(msg);
+  for (const [id, info] of AGENTS) {
+    if (info.name === name) { info.ws.send(data); return true; }
+  }
+  return false;
+}
+
 function broadcast(senderId, msg) {
   const data = JSON.stringify(msg);
-  for (const [id, ws] of AGENTS) {
-    if (id !== senderId) ws.send(data);
+  for (const [id, info] of AGENTS) {
+    if (id !== senderId) info.ws.send(data);
   }
 }
 
 function statusMsg() {
   const list = [];
-  for (const [id, info] of AGENTS) list.push({ id, name: info.name, connected: info.connected });
+  for (const [id, info] of AGENTS) list.push({ id, name: info.name, executor: !!info.executor, connected: info.connected });
   return JSON.stringify({ type: 'status', agents: list, count: list.length });
 }
 
@@ -90,7 +98,7 @@ const ws = new WebSocket('wss://' + location.host);
 ws.onmessage = e => {
   const d = JSON.parse(e.data);
   if (d.type === 'status') { document.getElementById('count').textContent = d.count;
-    document.getElementById('agents').innerHTML = d.agents.map(a => '<li>' + a.name + ' (' + a.id + ')</li>').join(''); }
+    document.getElementById('agents').innerHTML = d.agents.map(a => '<li>' + a.name + (a.executor?' (executor)':'') + '</li>').join(''); }
   else document.getElementById('log').textContent += JSON.stringify(d) + '\\n';
 };
 ws.onopen = () => ws.send(JSON.stringify({type:'join',name:'Web UI'}));
@@ -113,29 +121,62 @@ const wss = new WebSocketServer(server);
 wss.on('connection', ws => {
   const id = crypto.randomUUID();
   let name = 'unknown';
+  let isExecutor = false;
 
   ws.on('message', raw => {
     try {
       const msg = JSON.parse(raw);
+
       if (msg.type === 'join') {
         name = msg.name || 'anonymous';
-        AGENTS.set(id, { ws, name, connected: new Date().toISOString() });
-        broadcast(id, { type: 'join', id, name, agents: AGENTS.size });
+        isExecutor = !!msg.executor;
+        AGENTS.set(id, { ws, name, executor: isExecutor, connected: new Date().toISOString() });
+        broadcast(id, { type: 'join', id, name, executor: isExecutor, agents: AGENTS.size });
         broadcast(null, JSON.parse(statusMsg()));
         return;
       }
-      if (msg.type === 'message' || msg.type === 'chat') {
-        broadcast(id, { type: 'chat', from: name, id, text: msg.text || msg.message, timestamp: new Date().toISOString() });
+
+      if (msg.type === 'chat') {
+        broadcast(id, { type: 'chat', from: name, id, text: msg.text, timestamp: new Date().toISOString() });
         return;
       }
+
+      if (msg.type === 'mcp_call') {
+        const target = msg.target || 'opencode';
+        const sent = sendTo(target, {
+          type: 'mcp_call',
+          callId: msg.callId,
+          method: msg.method,
+          params: msg.params,
+          fromName: name,
+          fromId: id,
+        });
+        ws.send(JSON.stringify({ type: 'mcp_call_ack', callId: msg.callId, delivered: sent, target }));
+        return;
+      }
+
+      if (msg.type === 'mcp_result') {
+        // Forward result back to the caller (agent that made the mcp_call)
+        const sent = sendTo(msg.fromName, {
+          type: 'mcp_result',
+          callId: msg.callId,
+          result: msg.result,
+          error: msg.error,
+        });
+        if (!sent) {
+          ws.send(JSON.stringify({ type: 'mcp_result_undelivered', callId: msg.callId }));
+        }
+        return;
+      }
+
       if (msg.type === 'ping') {
         ws.send(JSON.stringify({ type: 'pong' }));
         return;
       }
-      // Forward unknown types
+
       broadcast(id, { ...msg, from: name, id });
     } catch (e) {
-      // ignore malformed
+      ws.send(JSON.stringify({ type: 'error', message: e.message }));
     }
   });
 
