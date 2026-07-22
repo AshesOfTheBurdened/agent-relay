@@ -4,6 +4,10 @@ services:
   runtime: node
   repo: https://github.com/AshesOfTheBurdened/agent-relay
   plan: free
+  healthCheckPath: /health
+  maxShutdownDelaySeconds: 10
   envVars:
   - key: PORT
     value: "8080"
+  - key: AGENT_RELAY_TOKEN
+    sync: false

@@ -1,287 +1,210 @@
 #!/usr/bin/env node
+'use strict';
+
 const http = require('http');
 const https = require('https');
-const { execSync } = require('child_process');
-const { readFileSync, writeFileSync, existsSync } = require('fs');
-const { readdir } = require('fs/promises');
-const { resolve, isAbsolute } = require('path');
 const crypto = require('crypto');
+const { execSync, execFileSync } = require('child_process');
+const { readFileSync, writeFileSync } = require('fs');
+const { resolve, relative, isAbsolute, sep } = require('path');
+const { WebSocketConnection, acceptKey } = require('./websocket');
 
 const RELAY_URL = process.env.RELAY_URL || 'ws://localhost:8080';
 const AGENT_NAME = process.env.AGENT_NAME || 'opencode';
-const WORKSPACE = process.env.MCP_WORKSPACE || process.env.HOME || '/home/nixuser/workspace';
-const RECONNECT_DELAY = 3000;
+const RELAY_TOKEN = process.env.AGENT_RELAY_TOKEN || '';
+const WORKSPACE = resolve(process.env.MCP_WORKSPACE || process.cwd());
+const RECONNECT_INITIAL_MS = Math.max(250, Number(process.env.RECONNECT_INITIAL_MS) || 1_000);
+const RECONNECT_MAX_MS = Math.max(RECONNECT_INITIAL_MS, Number(process.env.RECONNECT_MAX_MS) || 30_000);
+const CONNECTION_TIMEOUT_MS = Math.max(1_000, Number(process.env.CONNECTION_TIMEOUT_MS) || 15_000);
+const HEARTBEAT_INTERVAL_MS = Math.max(5_000, Number(process.env.AGENT_HEARTBEAT_INTERVAL_MS) || 20_000);
 
-// ── MCP Tool Handlers ─────────────────────────────────────────────
+function workspacePath(candidate = '.') {
+  const absolute = resolve(WORKSPACE, candidate);
+  const pathFromWorkspace = relative(WORKSPACE, absolute);
+  if (pathFromWorkspace === '' || (!pathFromWorkspace.startsWith(`..${sep}`) && pathFromWorkspace !== '..' && !isAbsolute(pathFromWorkspace))) return absolute;
+  throw new Error('Path must stay inside MCP_WORKSPACE');
+}
 
-function executeCommand(args) {
-  const cmd = args.command || '';
-  const cwd = args.cwd || WORKSPACE;
-  const timeout = Math.min(args.timeout || 30000, 60000);
+// These handlers intentionally expose a local execution surface. Deploy this agent only with a relay token
+// and a workspace/account that is scoped to the work you want a remote agent to perform.
+function executeCommand(args = {}) {
+  const command = typeof args.command === 'string' ? args.command : '';
+  const cwd = workspacePath(args.cwd || '.');
+  const timeout = Math.min(Math.max(1_000, Number(args.timeout) || 30_000), 60_000);
+  if (!command) return { stdout: '', stderr: 'command is required', exitCode: 2 };
   try {
-    const out = execSync(cmd, { cwd, timeout, encoding: 'utf-8', maxBuffer: 10 * 1024 * 1024 });
-    return { stdout: out, stderr: '', exitCode: 0 };
-  } catch (e) {
-    return { stdout: e.stdout || '', stderr: e.stderr || e.message, exitCode: e.status || 1 };
+    const stdout = execSync(command, { cwd, timeout, encoding: 'utf8', maxBuffer: 10 * 1024 * 1024, windowsHide: true });
+    return { stdout, stderr: '', exitCode: 0 };
+  } catch (error) {
+    return { stdout: error.stdout || '', stderr: error.stderr || error.message, exitCode: Number.isInteger(error.status) ? error.status : 1 };
   }
 }
 
-function readFile(args) {
-  const p = args.path || '';
-  const abs = isAbsolute(p) ? p : resolve(WORKSPACE, p);
-  const offset = args.offset || 0;
-  const limit = args.limit || 0;
+function readFile(args = {}) {
   try {
-    let content = readFileSync(abs, 'utf-8');
-    const lines = content.split('\n');
-    const totalLines = lines.length;
-    const start = Math.max(0, offset);
-    const end = limit > 0 ? Math.min(start + limit, totalLines) : totalLines;
-    return { content: lines.slice(start, end).join('\n'), totalLines, startLine: start, path: abs };
-  } catch (e) {
-    return { error: e.message, path: abs };
-  }
+    const path = workspacePath(args.path || '');
+    const lines = readFileSync(path, 'utf8').split('\n');
+    const offset = Math.max(0, Number(args.offset) || 0);
+    const limit = Math.max(0, Number(args.limit) || 0);
+    const end = limit ? Math.min(offset + limit, lines.length) : lines.length;
+    return { content: lines.slice(offset, end).join('\n'), totalLines: lines.length, startLine: offset, path };
+  } catch (error) { return { error: error.message }; }
 }
 
-function writeFile(args) {
-  const p = args.path || '';
-  const abs = isAbsolute(p) ? p : resolve(WORKSPACE, p);
+function writeFile(args = {}) {
   try {
-    writeFileSync(abs, args.content || '', 'utf-8');
-    return { path: abs, size: (args.content || '').length };
-  } catch (e) {
-    return { error: e.message, path: abs };
-  }
+    const path = workspacePath(args.path || '');
+    const content = typeof args.content === 'string' ? args.content : '';
+    writeFileSync(path, content, 'utf8');
+    return { path, size: Buffer.byteLength(content) };
+  } catch (error) { return { error: error.message }; }
 }
 
-function searchFiles(args) {
-  const p = args.path || WORKSPACE;
-  const pattern = args.pattern || '';
-  const abs = isAbsolute(p) ? p : resolve(WORKSPACE, p);
+function searchFiles(args = {}) {
   try {
-    const result = execSync(`find "${abs}" -type f -name "${pattern}" 2>/dev/null | head -100`, { encoding: 'utf-8', timeout: 10000 });
-    const matches = result.split('\n').filter(Boolean);
-    return { matches, count: matches.length, path: abs };
-  } catch (e) {
-    return { matches: [], error: e.message, path: abs };
-  }
+    const path = workspacePath(args.path || '.');
+    const pattern = typeof args.pattern === 'string' && args.pattern ? args.pattern : '*';
+    const output = execFileSync('find', [path, '-type', 'f', '-name', pattern], { encoding: 'utf8', timeout: 10_000, maxBuffer: 2 * 1024 * 1024, windowsHide: true });
+    const matches = output.split('\n').filter(Boolean).slice(0, 100);
+    return { matches, count: matches.length, path, truncated: matches.length === 100 };
+  } catch (error) { return { matches: [], error: error.message }; }
 }
 
-function searchContent(args) {
-  const p = args.path || WORKSPACE;
-  const pattern = args.pattern || '';
-  const abs = isAbsolute(p) ? p : resolve(WORKSPACE, p);
+function searchContent(args = {}) {
   try {
-    const { execSync } = require('child_process');
-    const result = execSync(`grep -rn '${pattern.replace(/'/g, "'\\''")}' "${abs}" --include="*.{js,ts,tsx,jsx,json,html,css,md}" 2>/dev/null | head -200`, { encoding: 'utf-8', timeout: 10000 });
-    const matches = result.split('\n').filter(Boolean).map(line => {
-      const parts = line.split(':');
-      return { file: parts[0], line: parseInt(parts[1]) || 0, content: parts.slice(2).join(':') };
+    const path = workspacePath(args.path || '.');
+    const pattern = typeof args.pattern === 'string' ? args.pattern : '';
+    if (!pattern) return { matches: [], count: 0, path };
+    const output = execFileSync('grep', ['-rIn', '--include=*.js', '--include=*.ts', '--include=*.tsx', '--include=*.jsx', '--include=*.json', '--include=*.html', '--include=*.css', '--include=*.md', '--', pattern, path], { encoding: 'utf8', timeout: 10_000, maxBuffer: 2 * 1024 * 1024, windowsHide: true });
+    const matches = output.split('\n').filter(Boolean).slice(0, 200).map(line => {
+      const [file, lineNumber, ...content] = line.split(':');
+      return { file, line: Number(lineNumber) || 0, content: content.join(':') };
     });
-    return { matches, count: matches.length, path: abs };
-  } catch (e) {
-    return { matches: [], error: e.message };
+    return { matches, count: matches.length, path, truncated: matches.length === 200 };
+  } catch (error) {
+    // grep uses exit status 1 when it finds no matches; that is a successful empty result.
+    if (error.status === 1) return { matches: [], count: 0, path: args.path || WORKSPACE };
+    return { matches: [], error: error.message };
   }
 }
 
 function getEnvironment() {
-  try {
-    const { execSync } = require('child_process');
-    const tools = ['node', 'npm', 'git', 'python3', 'curl', 'grep', 'find', 'sed', 'awk', 'gcc', 'rustc', 'cargo', 'go'];
-    const available = {};
-    for (const t of tools) {
-      try { execSync(`which ${t} 2>/dev/null`, { timeout: 2000 }); available[t] = true; } catch { available[t] = false; }
-    }
-    return {
-      agent: AGENT_NAME,
-      workspace: WORKSPACE,
-      platform: process.platform,
-      arch: process.arch,
-      nodeVersion: process.version,
-      tools: available,
-    };
-  } catch (e) {
-    return { agent: AGENT_NAME, workspace: WORKSPACE, error: e.message };
+  const tools = ['node', 'npm', 'git', 'python3', 'curl', 'grep', 'find', 'sed', 'awk', 'gcc', 'rustc', 'cargo', 'go'];
+  const available = {};
+  for (const tool of tools) {
+    try { execFileSync(process.platform === 'win32' ? 'where' : 'which', [tool], { stdio: 'ignore', timeout: 2_000, windowsHide: true }); available[tool] = true; }
+    catch { available[tool] = false; }
   }
+  return { agent: AGENT_NAME, workspace: WORKSPACE, platform: process.platform, arch: process.arch, nodeVersion: process.version, tools: available };
 }
 
-const TOOLS = {
-  execute_command: executeCommand,
-  read_file: readFile,
-  write_file: writeFile,
-  search_files: searchFiles,
-  search_content: searchContent,
-  get_environment: getEnvironment,
-};
+const TOOLS = { execute_command: executeCommand, read_file: readFile, write_file: writeFile, search_files: searchFiles, search_content: searchContent, get_environment: getEnvironment };
 
-// ── WebSocket Client ──────────────────────────────────────────────
+let activeConnection = null;
+let reconnectTimer = null;
+let reconnectAttempt = 0;
+let stopping = false;
+
+function scheduleReconnect(reason) {
+  if (stopping || reconnectTimer) return;
+  const capped = Math.min(RECONNECT_MAX_MS, RECONNECT_INITIAL_MS * (2 ** reconnectAttempt));
+  const delay = Math.round(capped * (0.8 + Math.random() * 0.4));
+  reconnectAttempt++;
+  console.warn(`[agent] ${reason}; reconnecting in ${delay}ms`);
+  reconnectTimer = setTimeout(() => { reconnectTimer = null; connect(); }, delay);
+  reconnectTimer.unref?.();
+}
 
 function connect() {
-  console.log(`[agent] Connecting to ${RELAY_URL} as "${AGENT_NAME}" (executor)...`);
-
-  const isWss = RELAY_URL.startsWith('wss');
-
-  // Parse URL
-  const url = new URL(RELAY_URL);
-  const port = parseInt(url.port) || (isWss ? 443 : 80);
-
-  const key = crypto.randomBytes(16).toString('base64');
-  const httpMod = isWss ? https : http;
-  const req = httpMod.request({
-    hostname: url.hostname,
-    port,
-    method: 'GET',
-    path: url.pathname || '/',
-    headers: {
-      'Upgrade': 'websocket',
-      'Connection': 'Upgrade',
-      'Sec-WebSocket-Key': key,
-      'Sec-WebSocket-Version': '13',
-    },
-    rejectUnauthorized: false,
-  });
-
-  req.on('upgrade', (res, socket) => {
-    console.log('[agent] Connected to relay');
-    const accept = res.headers['sec-websocket-accept'];
-    if (!accept) { console.error('[agent] No WebSocket accept header'); return; }
-
-    // Send join after short delay
-    setTimeout(() => sendFrame(socket, { type: 'join', name: AGENT_NAME, executor: true }), 200);
-
-    let buf = Buffer.alloc(0);
-
-    socket.on('data', data => {
-      buf = Buffer.concat([buf, data]);
-      while (buf.length >= 2) {
-        const op = buf[0] & 0x0f;
-        const masked = (buf[1] & 0x80) !== 0;
-        let len = buf[1] & 0x7f;
-        let off = 2;
-        if (len === 126) { if (buf.length < 4) break; len = buf.readUInt16BE(2); off = 4; }
-        if (len === 127) { if (buf.length < 10) break; len = Number(buf.readBigUInt64BE(2)); off = 10; }
-        let mask = null;
-        if (masked) { if (buf.length < off + 4) break; mask = buf.slice(off, off + 4); off += 4; }
-        if (buf.length < off + len) break;
-        let payload = buf.slice(off, off + len);
-        if (mask) for (let i = 0; i < payload.length; i++) payload[i] ^= mask[i % 4];
-        buf = buf.slice(off + len);
-        if (op === 1) handleMessage(payload.toString('utf8'), socket);
-        if (op === 8) { console.log('[agent] Relay closed connection'); reconnect(); return; }
-        if (op === 9) sendRaw(socket, 0x0a, payload);
-      }
-    });
-
-    socket.on('close', () => {
-      console.log('[agent] Disconnected from relay');
-      reconnect();
-    });
-
-    socket.on('error', e => {
-      console.error('[agent] Socket error:', e.message);
-    });
-
-    // Keepalive ping every 30s
-    const interval = setInterval(() => {
-      if (!socket.destroyed) sendRaw(socket, 0x09, Buffer.alloc(0));
-      else { clearInterval(interval); }
-    }, 30000);
-  });
-
-  req.on('error', e => {
-    console.error('[agent] Connection error:', e.message);
-    reconnect();
-  });
-
-  req.end();
-}
-
-function sendFrame(socket, msg) {
-  const data = Buffer.from(JSON.stringify(msg), 'utf8');
-  const mask = crypto.randomBytes(4);
-  for (let i = 0; i < data.length; i++) data[i] ^= mask[i % 4];
-  const h = Buffer.alloc(data.length < 126 ? 6 : data.length < 65536 ? 8 : 14);
-  h[0] = 0x81;
-  let off = 2;
-  if (data.length < 126) { h[1] = 0x80 | data.length; }
-  else if (data.length < 65536) { h[1] = 0x80 | 126; h.writeUInt16BE(data.length, 2); off = 4; }
-  else { h[1] = 0x80 | 127; h.writeBigUInt64BE(BigInt(data.length), 2); off = 10; }
-  mask.copy(h, off);
-  off += 4;
-  socket.write(Buffer.concat([h.slice(0, off), data]));
-}
-
-function sendRaw(socket, op, payload) {
-  const h = Buffer.alloc(2);
-  h[0] = 0x80 | op;
-  if (payload.length < 126) { h[1] = payload.length; socket.write(Buffer.concat([h, payload])); }
-  else if (payload.length < 65536) { h[1] = 126; const e = Buffer.alloc(2); e.writeUInt16BE(payload.length); socket.write(Buffer.concat([h, e, payload])); }
-  else { h[1] = 127; const e = Buffer.alloc(8); e.writeBigUInt64BE(BigInt(payload.length)); socket.write(Buffer.concat([h, e, payload])); }
-}
-
-function handleMessage(raw, socket) {
+  if (stopping || activeConnection) return;
+  let url;
   try {
-    const msg = JSON.parse(raw);
+    url = new URL(RELAY_URL);
+    if (!['ws:', 'wss:'].includes(url.protocol)) throw new Error('RELAY_URL must use ws:// or wss://');
+  } catch (error) { console.error(`[agent] Invalid RELAY_URL: ${error.message}`); return; }
 
-    if (msg.type === 'mcp_call') {
-      const tool = TOOLS[msg.method];
-      if (!tool) {
-        sendFrame(socket, {
-          type: 'mcp_result',
-          callId: msg.callId,
-          fromName: msg.fromName,
-          error: `Tool not found: ${msg.method}`,
-        });
-        return;
-      }
-
-      // Execute (handle sync and async)
-      const resultOrPromise = tool(msg.params || {});
-      Promise.resolve(resultOrPromise).then(result => {
-        sendFrame(socket, {
-          type: 'mcp_result',
-          callId: msg.callId,
-          fromName: msg.fromName,
-          result,
-        });
-      }).catch(err => {
-        sendFrame(socket, {
-          type: 'mcp_result',
-          callId: msg.callId,
-          fromName: msg.fromName,
-          error: err.message,
-        });
-      });
-      return;
+  const secure = url.protocol === 'wss:';
+  const key = crypto.randomBytes(16).toString('base64');
+  const request = (secure ? https : http).request({
+    hostname: url.hostname,
+    port: Number(url.port) || (secure ? 443 : 80),
+    method: 'GET',
+    path: `${url.pathname || '/'}${url.search || ''}`,
+    headers: { Upgrade: 'websocket', Connection: 'Upgrade', 'Sec-WebSocket-Key': key, 'Sec-WebSocket-Version': '13' },
+    // Never disable TLS validation by default. Set this only for a deliberately self-signed development relay.
+    rejectUnauthorized: process.env.RELAY_TLS_REJECT_UNAUTHORIZED !== 'false',
+  });
+  request.setTimeout(CONNECTION_TIMEOUT_MS, () => request.destroy(new Error('Connection timed out')));
+  request.once('upgrade', (response, socket, head) => {
+    if (response.statusCode !== 101 || response.headers['sec-websocket-accept'] !== acceptKey(key)) {
+      socket.destroy();
+      return scheduleReconnect('Relay returned an invalid WebSocket handshake');
     }
-
-    if (msg.type === 'chat') {
-      console.log(`[chat ${msg.from}] ${msg.text}`);
-      return;
-    }
-
-    if (msg.type === 'status') {
-      console.log(`[status] ${msg.count} agent(s) online: ${msg.agents.map(a => a.name + (a.executor ? '*' : '')).join(', ')}`);
-      return;
-    }
-
-    if (msg.type === 'pong') return;
-  } catch (e) {
-    console.error('[agent] Parse error:', e.message);
-  }
+    const connection = new WebSocketConnection(socket, { initialData: head, maskOutgoing: true });
+    const connectedAt = Date.now();
+    activeConnection = connection;
+    console.log(`[agent] Connected to ${RELAY_URL} as "${AGENT_NAME}"`);
+    const join = { type: 'join', name: AGENT_NAME, executor: true };
+    if (RELAY_TOKEN) join.token = RELAY_TOKEN;
+    connection.send(JSON.stringify(join));
+    const heartbeat = setInterval(() => connection.ping(), HEARTBEAT_INTERVAL_MS);
+    heartbeat.unref?.();
+    connection.on('socketError', error => console.warn(`[agent] Socket error: ${error.message}`));
+    connection.on('message', raw => handleMessage(raw, connection));
+    connection.on('close', () => {
+      clearInterval(heartbeat);
+      if (activeConnection !== connection) return;
+      activeConnection = null;
+      if (Date.now() - connectedAt >= 20_000) reconnectAttempt = 0;
+      scheduleReconnect('Relay connection closed');
+    });
+  });
+  request.once('response', response => {
+    response.resume();
+    scheduleReconnect(`Relay rejected WebSocket upgrade (${response.statusCode})`);
+  });
+  request.once('error', error => scheduleReconnect(`Connection error: ${error.message}`));
+  request.end();
 }
 
-let reconnectTimer = null;
-function reconnect() {
-  if (reconnectTimer) clearTimeout(reconnectTimer);
-  reconnectTimer = setTimeout(connect, RECONNECT_DELAY);
+async function handleMessage(raw, connection) {
+  let message;
+  try { message = JSON.parse(raw); } catch { return console.warn('[agent] Received invalid JSON from relay'); }
+  if (message.type === 'joined') return console.log(`[agent] Registered as ${message.name} (${message.id})`);
+  if (message.type === 'status') return console.log(`[status] ${message.count} online: ${message.agents.map(agent => `${agent.name}${agent.executor ? '*' : ''}`).join(', ')}`);
+  if (message.type === 'chat') return console.log(`[chat ${message.from}] ${message.text}`);
+  if (message.type === 'error') return console.error(`[relay] ${message.code || 'error'}: ${message.message}`);
+  if (message.type !== 'mcp_call') return;
+
+  const tool = TOOLS[message.method];
+  let result;
+  let error;
+  try {
+    if (!tool) throw new Error(`Tool not found: ${message.method}`);
+    result = await Promise.resolve(tool(message.params || {}));
+  } catch (cause) { error = cause.message || String(cause); }
+  if (!connection.isOpen) return;
+  connection.send(JSON.stringify({
+    type: 'mcp_result', relayCallId: message.relayCallId, callId: message.callId,
+    ...(error ? { error } : { result }),
+  }));
 }
 
-// ── Main ──────────────────────────────────────────────────────────
+function shutdown(signal) {
+  if (stopping) return;
+  stopping = true;
+  clearTimeout(reconnectTimer);
+  console.log(`[agent] Received ${signal}; disconnecting`);
+  if (activeConnection) activeConnection.close(1000, 'Agent shutting down');
+  setTimeout(() => process.exit(0), 500).unref();
+}
 
 if (require.main === module) {
+  if (!RELAY_TOKEN) console.warn('[agent] AGENT_RELAY_TOKEN is not set. Do not expose an executor on an unauthenticated relay.');
+  console.log(`[agent] Starting "${AGENT_NAME}" in ${WORKSPACE}`);
   connect();
-  console.log(`[agent] Agent "${AGENT_NAME}" starting`);
-  console.log(`[agent] Workspace: ${WORKSPACE}`);
-  console.log(`[agent] Relay: ${RELAY_URL}`);
+  process.on('SIGINT', () => shutdown('SIGINT'));
+  process.on('SIGTERM', () => shutdown('SIGTERM'));
 }
+
+module.exports = { TOOLS, workspacePath };
