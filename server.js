@@ -13,6 +13,8 @@ const DEFAULTS = Object.freeze({
   heartbeatTimeoutMs: Number(process.env.HEARTBEAT_TIMEOUT_MS) || 75_000,
   joinTimeoutMs: Number(process.env.JOIN_TIMEOUT_MS) || 15_000,
   callTimeoutMs: Number(process.env.CALL_TIMEOUT_MS) || 60_000,
+  rateLimitMaxPerWindow: Number(process.env.RATE_LIMIT_MAX) || 100,
+  rateLimitWindowMs: Number(process.env.RATE_LIMIT_WINDOW_MS) || 1_000,
 });
 
 function sendJson(ws, message) {
@@ -91,7 +93,21 @@ function createRelay(overrides = {}) {
   const pendingCalls = new Map();
   const startedAt = Date.now();
   const stats = { connections: 0, joins: 0, messages: 0, rejected: 0, mcpCalls: 0, mcpTimeouts: 0 };
+  const rateLimits = new Map();
   let accepting = true;
+
+  function checkRate(agentId) {
+    if (!config.rateLimitMaxPerWindow) return true;
+    const now = Date.now();
+    let timestamps = rateLimits.get(agentId);
+    if (!timestamps) { rateLimits.set(agentId, [now]); return true; }
+    const cutoff = now - config.rateLimitWindowMs;
+    timestamps = timestamps.filter(t => t > cutoff);
+    if (timestamps.length >= config.rateLimitMaxPerWindow) { rateLimits.set(agentId, timestamps); return false; }
+    timestamps.push(now);
+    rateLimits.set(agentId, timestamps);
+    return true;
+  }
 
   const server = http.createServer((req, res) => {
     const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
@@ -141,6 +157,7 @@ function createRelay(overrides = {}) {
     const info = agents.get(id);
     if (!info) return;
     agents.delete(id);
+    rateLimits.delete(id);
     for (const [relayCallId, call] of pendingCalls) {
       if (call.callerId === id) forgetCall(relayCallId);
       else if (call.executorId === id) forgetCall(relayCallId, 'Executor disconnected before responding');
@@ -194,6 +211,7 @@ function createRelay(overrides = {}) {
         const name = validName(message.name);
         if (!name) return reject('invalid_name', 'name must be 1-80 printable characters');
         if (!tokenMatches(message.token, config.token)) return reject('unauthorized', 'Invalid relay token', true);
+        if ([...agents.values()].some(a => a.name === name)) return reject('name_taken', 'Name is already in use', true);
         joined = true;
         clearTimeout(joinTimer);
         const info = { ws, name, executor: Boolean(message.executor), connected: new Date().toISOString(), lastPong: Date.now() };
@@ -210,6 +228,7 @@ function createRelay(overrides = {}) {
       const sender = agents.get(id);
       if (!sender) return;
       sender.lastPong = Date.now();
+      if (!checkRate(id)) return reject('rate_limited', 'Too many messages — slow down');
 
       if (message.type === 'status') return sendJson(ws, status());
       if (message.type === 'ping') return sendJson(ws, { type: 'pong', timestamp: new Date().toISOString() });
