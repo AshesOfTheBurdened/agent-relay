@@ -56,7 +56,7 @@ class QwenAgent:
                 print(f"[qwen] Connected!")
 
                 await self.send({
-                    "type": "hello",
+                    "type": "join",
                     "name": self.name,
                     "token": self.token,
                     "sessionId": self.session_id,
@@ -173,7 +173,7 @@ class QwenAgent:
             print(f"[chat received] {text}")
             return {"content": [{"type": "text", "text": f"Echo: {text}"}]}
 
-        elif method == "execute_bash":
+        elif method == "execute_command" or method == "execute_bash":
             command = params.get("command", "")
             if not command:
                 return {"isError": True, "content": [{"type": "text", "text": "No command provided"}]}
