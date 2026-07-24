@@ -3,9 +3,9 @@
 
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
 const { execSync, execFileSync } = require('child_process');
 const config = require('./config');
-const { CHANNELS, encode, decode, isBinaryFrame, HEADER_SIZE } = require('./protocol');
 const { logger, child } = require('./logger');
 
 const log = child({ agent: config.agentName });
@@ -141,29 +141,30 @@ registerTool('get_environment', () => {
   };
 });
 
-let WebSocketLib;
-try {
-  WebSocketLib = require('ws');
-} catch {
-  WebSocketLib = null;
-}
+const { WebSocketConnection, acceptKey } = require('./websocket');
 
 function connect() {
   if (shuttingDown) return;
-  if (!WebSocketLib) {
-    log.error('ws library not available — install with: npm install ws');
-    return;
-  }
 
   log.info({ url: config.relayUrl, attempt: reconnectAttempt }, 'Connecting to relay...');
 
-  ws = new WebSocketLib(config.relayUrl, {
-    maxPayload: config.maxMessageSize,
-    handshakeTimeout: 10_000,
+  const url = new URL(config.relayUrl);
+  if (!['ws:', 'wss:'].includes(url.protocol)) { log.error('Invalid relay URL protocol'); return; }
+
+  const secure = url.protocol === 'wss:';
+  const key = crypto.randomBytes(16).toString('base64');
+  const request = (secure ? require('https') : require('http')).request({
+    hostname: url.hostname, port: Number(url.port) || (secure ? 443 : 80),
+    method: 'GET', path: `${url.pathname || '/'}${url.search || ''}`,
+    headers: { Upgrade: 'websocket', Connection: 'Upgrade', 'Sec-WebSocket-Key': key, 'Sec-WebSocket-Version': '13' },
     rejectUnauthorized: process.env.RELAY_TLS_REJECT_UNAUTHORIZED !== 'false',
   });
 
-  ws.on('open', () => {
+  request.setTimeout(10_000, () => request.destroy(new Error('Connection timed out')));
+
+  request.once('upgrade', (response, socket, head) => {
+    if (response.statusCode !== 101) { socket.destroy(); return scheduleReconnect(`Relay rejected (${response.statusCode})`); }
+    ws = new WebSocketConnection(socket, { initialData: head, maskOutgoing: true });
     reconnectAttempt = 0;
     log.info('Connected!');
 
@@ -180,34 +181,33 @@ function connect() {
       sendControl({ type: 'heartbeat', timestamp: Date.now() });
     }, config.heartbeatIntervalMs);
     heartbeatTimer.unref?.();
-  });
 
-  ws.on('message', (data, isBinary) => {
-    try {
-      if (isBinary && isBinaryFrame(data)) {
-        const frame = decode(data);
-        if (!frame) return;
-        routeMessage(frame.channel, frame.msg);
-      } else {
-        const text = typeof data === 'string' ? data : Buffer.from(data).toString('utf8');
-        let msg;
-        try { msg = JSON.parse(text); } catch { return; }
+    ws.on('message', raw => {
+      try {
+        let msg = JSON.parse(raw);
         routeLegacyMessage(msg);
+      } catch (err) {
+        log.warn({ err: err.message }, 'Error parsing message');
       }
-    } catch (err) {
-      log.warn({ err: err.message }, 'Error handling message');
-    }
+    });
+
+    ws.on('close', () => {
+      log.warn('Disconnected');
+      cleanup();
+      scheduleReconnect();
+    });
+
+    ws.on('socketError', (err) => {
+      log.error({ err: err.message }, 'Socket error');
+    });
   });
 
-  ws.on('close', (code, reason) => {
-    log.warn({ code, reason: reason?.toString?.() }, 'Disconnected');
-    cleanup();
-    scheduleReconnect();
+  request.once('response', response => {
+    response.resume();
+    scheduleReconnect(`Relay rejected WebSocket upgrade (${response.statusCode})`);
   });
-
-  ws.on('error', (err) => {
-    log.error({ err: err.message }, 'WebSocket error');
-  });
+  request.once('error', error => scheduleReconnect(`Connection error: ${error.message}`));
+  request.end();
 }
 
 function cleanup() {
@@ -316,7 +316,7 @@ function handlePresence(msg) {
 }
 
 function sendControl(msg) {
-  if (!ws || ws.readyState !== 1) return false;
+  if (!ws || !ws.isOpen) return false;
   ws.send(JSON.stringify(msg));
   return true;
 }
@@ -329,7 +329,7 @@ function shutdown(signal) {
   cleanup();
   if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
 
-  if (ws && ws.readyState === 1) {
+  if (ws && !ws.closed) {
     sendControl({ type: 'goodbye', name: config.agentName });
     ws.close(1001, 'Agent shutting down');
   }
