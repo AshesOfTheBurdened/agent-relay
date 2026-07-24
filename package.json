@@ -10,17 +10,16 @@
     "check": "node --check server.js && node --check agent.js && node --check config.js && node --check protocol.js && node --check auth.js",
     "tokens": "node -e \"const {generateToken} = require('./auth');console.log('agent:',generateToken('agent','agent'));console.log('executor:',generateToken('executor','executor'));console.log('observer:',generateToken('observer','observer'));\""
   },
-  "optionalDependencies": {
+  "dependencies": {
     "msgpackr": "^1.10.0",
     "pino": "^8.17.0",
     "pino-pretty": "^10.3.0",
     "prom-client": "^15.1.0",
     "ioredis": "^5.3.2",
-    "jsonwebtoken": "^9.0.2"
-  },
-  "dependencies": {
+    "jsonwebtoken": "^9.0.2",
     "ws": "^8.16.0"
   },
+  "optionalDependencies": {},
   "engines": {
     "node": ">=18"
   },
