@@ -169,7 +169,7 @@ function connect() {
     log.info('Connected!');
 
     sendControl({
-      type: 'hello',
+      type: 'join',
       name: config.agentName,
       token: config.agentToken,
       sessionId,
