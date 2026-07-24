@@ -178,7 +178,7 @@ function connect() {
     });
 
     heartbeatTimer = setInterval(() => {
-      sendControl({ type: 'heartbeat', timestamp: Date.now() });
+      sendControl({ type: 'ping', timestamp: Date.now() });
     }, config.heartbeatIntervalMs);
     heartbeatTimer.unref?.();
 
