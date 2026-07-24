@@ -21,6 +21,7 @@ import random
 import argparse
 import traceback
 import platform
+import signal
 
 try:
     import websockets
@@ -363,7 +364,7 @@ async def main():
         shutdown_event.set()
 
     loop = asyncio.get_event_loop()
-    for sig in ("SIGINT", "SIGTERM"):
+    for sig in (signal.SIGINT, signal.SIGTERM):
         try:
             loop.add_signal_handler(sig, shutdown)
         except NotImplementedError:
