@@ -1,13 +1,28 @@
 {
   "name": "agent-relay",
-  "version": "1.1.0",
-  "description": "Authenticated, resilient WebSocket relay for multi-agent AI communication",
+  "version": "2.0.0",
+  "description": "Elite multi-agent WebSocket relay with MCP routing, binary protocol, JWT auth, and horizontal scaling",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "test": "node --test",
-    "check": "node --check server.js && node --check agent.js && node --check websocket.js"
+    "agent": "node agent.js",
+    "test": "node --test test/",
+    "check": "node --check server.js && node --check agent.js && node --check config.js && node --check protocol.js && node --check auth.js",
+    "tokens": "node -e \"const {generateToken} = require('./auth');console.log('agent:',generateToken('agent','agent'));console.log('executor:',generateToken('executor','executor'));console.log('observer:',generateToken('observer','observer'));\""
   },
-  "engines": { "node": ">=20" },
+  "optionalDependencies": {
+    "msgpackr": "^1.10.0",
+    "pino": "^8.17.0",
+    "pino-pretty": "^10.3.0",
+    "prom-client": "^15.1.0",
+    "ioredis": "^5.3.2",
+    "jsonwebtoken": "^9.0.2"
+  },
+  "dependencies": {
+    "ws": "^8.16.0"
+  },
+  "engines": {
+    "node": ">=18"
+  },
   "license": "MIT"
 }

@@ -1,0 +1,77 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Agent Relay Dashboard</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { font-family: 'SF Mono', 'Fira Code', monospace; background: #0a0a0f; color: #e0e0e0; padding: 2rem; }
+h1 { color: #00ff88; margin-bottom: 1rem; font-size: 1.5rem; }
+h2 { color: #888; font-size: 0.9rem; text-transform: uppercase; letter-spacing: 2px; margin: 2rem 0 1rem; }
+.grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 1rem; }
+.card { background: #12121a; border: 1px solid #1e1e2e; border-radius: 8px; padding: 1.2rem; }
+.card h3 { color: #00ff88; font-size: 0.85rem; margin-bottom: 0.8rem; }
+.stat { font-size: 2rem; font-weight: bold; color: #fff; }
+.stat-label { font-size: 0.75rem; color: #666; }
+.agent { display: flex; justify-content: space-between; padding: 0.5rem 0; border-bottom: 1px solid #1a1a2a; }
+.agent-name { color: #00ccff; }
+.agent-role { color: #666; font-size: 0.8rem; }
+.status-dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; margin-right: 6px; }
+.status-dot.online { background: #00ff88; box-shadow: 0 0 6px #00ff88; }
+.status-dot.open { background: #ff4444; box-shadow: 0 0 6px #ff4444; }
+.status-dot.half_open { background: #ffaa00; box-shadow: 0 0 6px #ffaa00; }
+.status-dot.closed { background: #00ff88; box-shadow: 0 0 6px #00ff88; }
+#error { color: #ff4444; display: none; }
+</style>
+</head>
+<body>
+<h1>Agent Relay v2</h1>
+<div id="error">Failed to fetch health data</div>
+<div class="grid">
+  <div class="card">
+    <h3>Connections</h3>
+    <div class="stat" id="agentCount">-</div>
+    <div class="stat-label">active agents</div>
+    <div id="agentList" style="margin-top:1rem"></div>
+  </div>
+  <div class="card">
+    <h3>MCP Calls</h3>
+    <div class="stat" id="mcpPending">-</div>
+    <div class="stat-label">pending calls</div>
+  </div>
+  <div class="card">
+    <h3>Server</h3>
+    <div class="stat" id="uptime">-</div>
+    <div class="stat-label">uptime (seconds)</div>
+  </div>
+  <div class="card">
+    <h3>Circuit Breakers</h3>
+    <div id="cbList"></div>
+  </div>
+</div>
+<p style="color:#444;font-size:0.7rem;margin-top:2rem">Auto-refreshes every 3s</p>
+<script>
+async function refresh() {
+  try {
+    const res = await fetch('/health');
+    const data = await res.json();
+    document.getElementById('agentCount').textContent = data.agents;
+    document.getElementById('mcpPending').textContent = data.pendingMcpCalls;
+    document.getElementById('uptime').textContent = Math.floor(data.uptime);
+    document.getElementById('agentList').innerHTML = (data.agentList || []).map(a =>
+      `<div class="agent"><span class="agent-name"><span class="status-dot online"></span>${a.name}</span><span class="agent-role">${a.role||'agent'}</span></div>`
+    ).join('') || '<div style="color:#666">No agents connected</div>';
+    document.getElementById('cbList').innerHTML = Object.entries(data.circuitBreakers || {}).map(([name, cb]) =>
+      `<div class="agent"><span class="agent-name"><span class="status-dot ${cb.state.toLowerCase()}"></span>${name}</span><span class="agent-role">${cb.state}</span></div>`
+    ).join('') || '<div style="color:#666">No circuit breakers active</div>';
+    document.getElementById('error').style.display = 'none';
+  } catch {
+    document.getElementById('error').style.display = 'block';
+  }
+}
+refresh();
+setInterval(refresh, 3000);
+</script>
+</body>
+</html>

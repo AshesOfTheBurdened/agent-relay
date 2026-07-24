@@ -1,210 +1,349 @@
 #!/usr/bin/env node
 'use strict';
 
-const http = require('http');
-const https = require('https');
-const crypto = require('crypto');
+const fs = require('fs');
+const path = require('path');
 const { execSync, execFileSync } = require('child_process');
-const { readFileSync, writeFileSync } = require('fs');
-const { resolve, relative, isAbsolute, sep } = require('path');
-const { WebSocketConnection, acceptKey } = require('./websocket');
+const config = require('./config');
+const { CHANNELS, encode, decode, isBinaryFrame, HEADER_SIZE } = require('./protocol');
+const { logger, child } = require('./logger');
 
-const RELAY_URL = process.env.RELAY_URL || 'ws://localhost:8080';
-const AGENT_NAME = process.env.AGENT_NAME || 'opencode';
-const RELAY_TOKEN = process.env.AGENT_RELAY_TOKEN || '';
-const WORKSPACE = resolve(process.env.MCP_WORKSPACE || process.cwd());
-const RECONNECT_INITIAL_MS = Math.max(250, Number(process.env.RECONNECT_INITIAL_MS) || 1_000);
-const RECONNECT_MAX_MS = Math.max(RECONNECT_INITIAL_MS, Number(process.env.RECONNECT_MAX_MS) || 30_000);
-const CONNECTION_TIMEOUT_MS = Math.max(1_000, Number(process.env.CONNECTION_TIMEOUT_MS) || 15_000);
-const HEARTBEAT_INTERVAL_MS = Math.max(5_000, Number(process.env.AGENT_HEARTBEAT_INTERVAL_MS) || 20_000);
+const log = child({ agent: config.agentName });
 
-function workspacePath(candidate = '.') {
-  const absolute = resolve(WORKSPACE, candidate);
-  const pathFromWorkspace = relative(WORKSPACE, absolute);
-  if (pathFromWorkspace === '' || (!pathFromWorkspace.startsWith(`..${sep}`) && pathFromWorkspace !== '..' && !isAbsolute(pathFromWorkspace))) return absolute;
-  throw new Error('Path must stay inside MCP_WORKSPACE');
-}
+let ws = null;
+let sessionId = null;
+let lastSeq = 0;
+let reconnectAttempt = 0;
+let reconnectTimer = null;
+let heartbeatTimer = null;
+let shuttingDown = false;
 
-// These handlers intentionally expose a local execution surface. Deploy this agent only with a relay token
-// and a workspace/account that is scoped to the work you want a remote agent to perform.
-function executeCommand(args = {}) {
-  const command = typeof args.command === 'string' ? args.command : '';
-  const cwd = workspacePath(args.cwd || '.');
-  const timeout = Math.min(Math.max(1_000, Number(args.timeout) || 30_000), 60_000);
-  if (!command) return { stdout: '', stderr: 'command is required', exitCode: 2 };
+const MAX_FILE_SIZE = 10 * 1024 * 1024;
+const MAX_OUTPUT_SIZE = 100 * 1024;
+const COMMAND_TIMEOUT = 30_000;
+
+function safePath(input) {
+  const resolved = path.resolve(config.mcpWorkspace, String(input || ''));
+  let real;
   try {
-    const stdout = execSync(command, { cwd, timeout, encoding: 'utf8', maxBuffer: 10 * 1024 * 1024, windowsHide: true });
-    return { stdout, stderr: '', exitCode: 0 };
-  } catch (error) {
-    return { stdout: error.stdout || '', stderr: error.stderr || error.message, exitCode: Number.isInteger(error.status) ? error.status : 1 };
+    real = fs.realpathSync(resolved);
+  } catch {
+    const dir = path.dirname(resolved);
+    let realDir;
+    try { realDir = fs.realpathSync(dir); } catch { realDir = dir; }
+    real = path.join(realDir, path.basename(resolved));
   }
+  const base = path.resolve(config.mcpWorkspace);
+  if (!real.startsWith(base + path.sep) && real !== base) {
+    throw new Error('Path escapes workspace');
+  }
+  return real;
 }
 
-function readFile(args = {}) {
+const tools = {};
+
+function registerTool(name, fn) {
+  tools[name] = fn;
+}
+
+registerTool('execute_command', (args = {}) => {
+  const command = typeof args.command === 'string' ? args.command : '';
+  const cwd = safePath(args.cwd || '.');
+  const timeout = Math.min(Math.max(1_000, Number(args.timeout) || COMMAND_TIMEOUT), 60_000);
+  if (!command) return { content: [{ type: 'text', text: 'command is required' }], isError: true };
   try {
-    const path = workspacePath(args.path || '');
-    const lines = readFileSync(path, 'utf8').split('\n');
+    const stdout = execSync(command, { cwd, timeout, encoding: 'utf8', maxBuffer: MAX_OUTPUT_SIZE, windowsHide: true });
+    return { content: [{ type: 'text', text: stdout || '(no output)' }] };
+  } catch (error) {
+    const text = (error.stdout || '') + (error.stderr ? '\n' + error.stderr : '') || error.message;
+    return { content: [{ type: 'text', text: text.slice(0, MAX_OUTPUT_SIZE) }], isError: true };
+  }
+});
+
+registerTool('read_file', (args = {}) => {
+  try {
+    const p = safePath(args.path || '');
+    const stats = fs.statSync(p);
+    if (stats.size > MAX_FILE_SIZE) {
+      return { content: [{ type: 'text', text: `File too large (${stats.size} bytes, max ${MAX_FILE_SIZE})` }], isError: true };
+    }
+    const lines = fs.readFileSync(p, 'utf8').split('\n');
     const offset = Math.max(0, Number(args.offset) || 0);
     const limit = Math.max(0, Number(args.limit) || 0);
     const end = limit ? Math.min(offset + limit, lines.length) : lines.length;
-    return { content: lines.slice(offset, end).join('\n'), totalLines: lines.length, startLine: offset, path };
-  } catch (error) { return { error: error.message }; }
-}
+    return {
+      content: [{ type: 'text', text: lines.slice(offset, end).join('\n') }],
+      totalLines: lines.length, startLine: offset, path: p,
+    };
+  } catch (error) {
+    return { content: [{ type: 'text', text: error.message }], isError: true };
+  }
+});
 
-function writeFile(args = {}) {
+registerTool('write_file', (args = {}) => {
   try {
-    const path = workspacePath(args.path || '');
+    const p = safePath(args.path || '');
     const content = typeof args.content === 'string' ? args.content : '';
-    writeFileSync(path, content, 'utf8');
-    return { path, size: Buffer.byteLength(content) };
-  } catch (error) { return { error: error.message }; }
-}
+    fs.mkdirSync(path.dirname(p), { recursive: true });
+    fs.writeFileSync(p, content, 'utf8');
+    return { content: [{ type: 'text', text: `Written ${Buffer.byteLength(content)} bytes to ${args.path}` }], size: Buffer.byteLength(content), path: args.path };
+  } catch (error) {
+    return { content: [{ type: 'text', text: error.message }], isError: true };
+  }
+});
 
-function searchFiles(args = {}) {
+registerTool('search_files', (args = {}) => {
   try {
-    const path = workspacePath(args.path || '.');
+    const p = safePath(args.path || '.');
     const pattern = typeof args.pattern === 'string' && args.pattern ? args.pattern : '*';
-    const output = execFileSync('find', [path, '-type', 'f', '-name', pattern], { encoding: 'utf8', timeout: 10_000, maxBuffer: 2 * 1024 * 1024, windowsHide: true });
+    const output = execFileSync('find', [p, '-type', 'f', '-name', pattern], { encoding: 'utf8', timeout: 10_000, maxBuffer: 2 * 1024 * 1024, windowsHide: true });
     const matches = output.split('\n').filter(Boolean).slice(0, 100);
-    return { matches, count: matches.length, path, truncated: matches.length === 100 };
-  } catch (error) { return { matches: [], error: error.message }; }
-}
+    return { content: [{ type: 'text', text: matches.join('\n') || '(no matches)' }], count: matches.length, truncated: matches.length === 100 };
+  } catch (error) {
+    return { content: [{ type: 'text', text: error.message }], isError: true };
+  }
+});
 
-function searchContent(args = {}) {
+registerTool('search_content', (args = {}) => {
   try {
-    const path = workspacePath(args.path || '.');
+    const p = safePath(args.path || '.');
     const pattern = typeof args.pattern === 'string' ? args.pattern : '';
-    if (!pattern) return { matches: [], count: 0, path };
-    const output = execFileSync('grep', ['-rIn', '--include=*.js', '--include=*.ts', '--include=*.tsx', '--include=*.jsx', '--include=*.json', '--include=*.html', '--include=*.css', '--include=*.md', '--', pattern, path], { encoding: 'utf8', timeout: 10_000, maxBuffer: 2 * 1024 * 1024, windowsHide: true });
+    if (!pattern) return { content: [{ type: 'text', text: 'pattern is required' }], isError: true };
+    const output = execFileSync('grep', ['-rIn', '--include=*.js', '--include=*.ts', '--include=*.tsx', '--include=*.jsx', '--include=*.json', '--include=*.html', '--include=*.css', '--include=*.md', '--', pattern, p], { encoding: 'utf8', timeout: 10_000, maxBuffer: 2 * 1024 * 1024, windowsHide: true });
     const matches = output.split('\n').filter(Boolean).slice(0, 200).map(line => {
       const [file, lineNumber, ...content] = line.split(':');
       return { file, line: Number(lineNumber) || 0, content: content.join(':') };
     });
-    return { matches, count: matches.length, path, truncated: matches.length === 200 };
+    return {
+      content: [{ type: 'text', text: matches.map(m => `${m.file}:${m.line}:${m.content}`).join('\n') || '(no matches)' }],
+      count: matches.length, truncated: matches.length === 200,
+    };
   } catch (error) {
-    // grep uses exit status 1 when it finds no matches; that is a successful empty result.
-    if (error.status === 1) return { matches: [], count: 0, path: args.path || WORKSPACE };
-    return { matches: [], error: error.message };
+    if (error.status === 1) return { content: [{ type: 'text', text: '(no matches)' }], count: 0 };
+    return { content: [{ type: 'text', text: error.message }], isError: true };
   }
-}
+});
 
-function getEnvironment() {
-  const tools = ['node', 'npm', 'git', 'python3', 'curl', 'grep', 'find', 'sed', 'awk', 'gcc', 'rustc', 'cargo', 'go'];
+registerTool('get_environment', () => {
+  const toolList = ['node', 'npm', 'git', 'python3', 'curl', 'grep', 'find', 'sed', 'awk', 'gcc', 'rustc', 'cargo', 'go', 'docker'];
   const available = {};
-  for (const tool of tools) {
+  for (const tool of toolList) {
     try { execFileSync(process.platform === 'win32' ? 'where' : 'which', [tool], { stdio: 'ignore', timeout: 2_000, windowsHide: true }); available[tool] = true; }
     catch { available[tool] = false; }
   }
-  return { agent: AGENT_NAME, workspace: WORKSPACE, platform: process.platform, arch: process.arch, nodeVersion: process.version, tools: available };
-}
+  return {
+    content: [{ type: 'text', text: JSON.stringify({
+      agent: config.agentName, workspace: config.mcpWorkspace,
+      platform: process.platform, arch: process.arch,
+      nodeVersion: process.version, pid: process.pid,
+      tools: available, uptime: process.uptime(),
+    }, null, 2) }],
+  };
+});
 
-const TOOLS = { execute_command: executeCommand, read_file: readFile, write_file: writeFile, search_files: searchFiles, search_content: searchContent, get_environment: getEnvironment };
-
-let activeConnection = null;
-let reconnectTimer = null;
-let reconnectAttempt = 0;
-let stopping = false;
-
-function scheduleReconnect(reason) {
-  if (stopping || reconnectTimer) return;
-  const capped = Math.min(RECONNECT_MAX_MS, RECONNECT_INITIAL_MS * (2 ** reconnectAttempt));
-  const delay = Math.round(capped * (0.8 + Math.random() * 0.4));
-  reconnectAttempt++;
-  console.warn(`[agent] ${reason}; reconnecting in ${delay}ms`);
-  reconnectTimer = setTimeout(() => { reconnectTimer = null; connect(); }, delay);
-  reconnectTimer.unref?.();
+let WebSocketLib;
+try {
+  WebSocketLib = require('ws');
+} catch {
+  WebSocketLib = null;
 }
 
 function connect() {
-  if (stopping || activeConnection) return;
-  let url;
-  try {
-    url = new URL(RELAY_URL);
-    if (!['ws:', 'wss:'].includes(url.protocol)) throw new Error('RELAY_URL must use ws:// or wss://');
-  } catch (error) { console.error(`[agent] Invalid RELAY_URL: ${error.message}`); return; }
+  if (shuttingDown) return;
+  if (!WebSocketLib) {
+    log.error('ws library not available — install with: npm install ws');
+    return;
+  }
 
-  const secure = url.protocol === 'wss:';
-  const key = crypto.randomBytes(16).toString('base64');
-  const request = (secure ? https : http).request({
-    hostname: url.hostname,
-    port: Number(url.port) || (secure ? 443 : 80),
-    method: 'GET',
-    path: `${url.pathname || '/'}${url.search || ''}`,
-    headers: { Upgrade: 'websocket', Connection: 'Upgrade', 'Sec-WebSocket-Key': key, 'Sec-WebSocket-Version': '13' },
-    // Never disable TLS validation by default. Set this only for a deliberately self-signed development relay.
+  log.info({ url: config.relayUrl, attempt: reconnectAttempt }, 'Connecting to relay...');
+
+  ws = new WebSocketLib(config.relayUrl, {
+    maxPayload: config.maxMessageSize,
+    handshakeTimeout: 10_000,
     rejectUnauthorized: process.env.RELAY_TLS_REJECT_UNAUTHORIZED !== 'false',
   });
-  request.setTimeout(CONNECTION_TIMEOUT_MS, () => request.destroy(new Error('Connection timed out')));
-  request.once('upgrade', (response, socket, head) => {
-    if (response.statusCode !== 101 || response.headers['sec-websocket-accept'] !== acceptKey(key)) {
-      socket.destroy();
-      return scheduleReconnect('Relay returned an invalid WebSocket handshake');
-    }
-    const connection = new WebSocketConnection(socket, { initialData: head, maskOutgoing: true });
-    const connectedAt = Date.now();
-    activeConnection = connection;
-    console.log(`[agent] Connected to ${RELAY_URL} as "${AGENT_NAME}"`);
-    const join = { type: 'join', name: AGENT_NAME, executor: true };
-    if (RELAY_TOKEN) join.token = RELAY_TOKEN;
-    connection.send(JSON.stringify(join));
-    const heartbeat = setInterval(() => connection.ping(), HEARTBEAT_INTERVAL_MS);
-    heartbeat.unref?.();
-    connection.on('socketError', error => console.warn(`[agent] Socket error: ${error.message}`));
-    connection.on('message', raw => handleMessage(raw, connection));
-    connection.on('close', () => {
-      clearInterval(heartbeat);
-      if (activeConnection !== connection) return;
-      activeConnection = null;
-      if (Date.now() - connectedAt >= 20_000) reconnectAttempt = 0;
-      scheduleReconnect('Relay connection closed');
+
+  ws.on('open', () => {
+    reconnectAttempt = 0;
+    log.info('Connected!');
+
+    sendControl({
+      type: 'hello',
+      name: config.agentName,
+      token: config.agentToken,
+      sessionId,
+      lastSeq,
+      executor: true,
     });
+
+    heartbeatTimer = setInterval(() => {
+      sendControl({ type: 'heartbeat', timestamp: Date.now() });
+    }, config.heartbeatIntervalMs);
+    heartbeatTimer.unref?.();
   });
-  request.once('response', response => {
-    response.resume();
-    scheduleReconnect(`Relay rejected WebSocket upgrade (${response.statusCode})`);
+
+  ws.on('message', (data, isBinary) => {
+    try {
+      if (isBinary && isBinaryFrame(data)) {
+        const frame = decode(data);
+        if (!frame) return;
+        routeMessage(frame.channel, frame.msg);
+      } else {
+        const text = typeof data === 'string' ? data : Buffer.from(data).toString('utf8');
+        let msg;
+        try { msg = JSON.parse(text); } catch { return; }
+        routeLegacyMessage(msg);
+      }
+    } catch (err) {
+      log.warn({ err: err.message }, 'Error handling message');
+    }
   });
-  request.once('error', error => scheduleReconnect(`Connection error: ${error.message}`));
-  request.end();
+
+  ws.on('close', (code, reason) => {
+    log.warn({ code, reason: reason?.toString?.() }, 'Disconnected');
+    cleanup();
+    scheduleReconnect();
+  });
+
+  ws.on('error', (err) => {
+    log.error({ err: err.message }, 'WebSocket error');
+  });
 }
 
-async function handleMessage(raw, connection) {
-  let message;
-  try { message = JSON.parse(raw); } catch { return console.warn('[agent] Received invalid JSON from relay'); }
-  if (message.type === 'joined') return console.log(`[agent] Registered as ${message.name} (${message.id})`);
-  if (message.type === 'status') return console.log(`[status] ${message.count} online: ${message.agents.map(agent => `${agent.name}${agent.executor ? '*' : ''}`).join(', ')}`);
-  if (message.type === 'chat') return console.log(`[chat ${message.from}] ${message.text}`);
-  if (message.type === 'error') return console.error(`[relay] ${message.code || 'error'}: ${message.message}`);
-  if (message.type !== 'mcp_call') return;
+function cleanup() {
+  if (heartbeatTimer) { clearInterval(heartbeatTimer); heartbeatTimer = null; }
+}
 
-  const tool = TOOLS[message.method];
-  let result;
-  let error;
-  try {
-    if (!tool) throw new Error(`Tool not found: ${message.method}`);
-    result = await Promise.resolve(tool(message.params || {}));
-  } catch (cause) { error = cause.message || String(cause); }
-  if (!connection.isOpen) return;
-  connection.send(JSON.stringify({
-    type: 'mcp_result', relayCallId: message.relayCallId, callId: message.callId,
-    ...(error ? { error } : { result }),
-  }));
+function scheduleReconnect() {
+  if (shuttingDown) return;
+  const base = Math.min(1000 * Math.pow(2, reconnectAttempt), 30_000);
+  const jitter = base * 0.3 * Math.random();
+  const delay = Math.round(base + jitter);
+  reconnectAttempt++;
+  log.info({ delay, attempt: reconnectAttempt }, `Reconnecting in ${delay}ms...`);
+  reconnectTimer = setTimeout(connect, delay);
+  reconnectTimer.unref?.();
+}
+
+function routeMessage(channel, msg) {
+  switch (channel) {
+    case CHANNELS.CONTROL: handleControl(msg); break;
+    case CHANNELS.CHAT: handleChat(msg); break;
+    case CHANNELS.MCP: handleMcp(msg); break;
+    case CHANNELS.STREAM: handleStream(msg); break;
+    case CHANNELS.PRESENCE: handlePresence(msg); break;
+  }
+}
+
+function routeLegacyMessage(msg) {
+  switch (msg.type) {
+    case 'joined': sessionId = msg.id; lastSeq = msg.seq || 0; log.info({ sessionId }, 'Registered'); break;
+    case 'status': log.info(`[status] ${msg.count} online`); break;
+    case 'chat': handleChat(msg); break;
+    case 'mcp_call': handleMcp(msg); break;
+    case 'error': log.error(`[relay] ${msg.message}`); break;
+    case 'pong': break;
+    case 'server.shutdown': log.warn('Server shutting down, will reconnect...'); break;
+  }
+}
+
+function handleControl(msg) {
+  switch (msg.type) {
+    case 'joined':
+      sessionId = msg.id || msg.sessionId;
+      lastSeq = msg.seq || 0;
+      log.info({ sessionId }, 'Registered');
+      break;
+    case 'welcome':
+      sessionId = msg.sessionId;
+      lastSeq = msg.seq || 0;
+      log.info({ sessionId, agents: msg.agents }, 'Joined relay');
+      break;
+    case 'status':
+      log.info(`[status] ${msg.count} online: ${(msg.agents || []).map(a => `${a.name}${a.executor ? '*' : ''}`).join(', ')}`);
+      break;
+    case 'error':
+      log.error(`[relay] ${msg.code || 'error'}: ${msg.message}`);
+      break;
+    case 'heartbeat.ack':
+      break;
+    case 'server.shutdown':
+      log.warn('Server shutting down...');
+      break;
+    default:
+      if (msg.type !== 'pong' && msg.type !== 'leave') {
+        log.debug({ type: msg.type }, 'Unhandled control message');
+      }
+  }
+}
+
+function handleChat(msg) {
+  if (msg.from && msg.text) {
+    log.info(`[chat ${msg.from}] ${msg.text}`);
+  }
+}
+
+async function handleMcp(msg) {
+  if (msg.type === 'mcp_call') {
+    const method = msg.method || msg.call?.name;
+    const callId = msg.callId || msg.call?.id;
+    const relayCallId = msg.relayCallId;
+    const params = msg.params ?? msg.call?.params ?? {};
+
+    const tool = tools[method];
+    let result;
+
+    log.info(`[exec] ${method} (call ${callId})`);
+
+    try {
+      if (!tool) throw new Error(`Tool not found: ${method}`);
+      result = await Promise.resolve(tool(params));
+    } catch (error) {
+      result = { content: [{ type: 'text', text: error.message }], isError: true };
+    }
+
+    const response = { type: 'mcp_result', relayCallId, callId, result };
+    ws.send(JSON.stringify(response));
+  }
+}
+
+function handleStream(msg) {
+  log.debug({ from: msg.from, streamId: msg.streamId }, 'Stream');
+}
+
+function handlePresence(msg) {
+  log.debug({ from: msg.from, status: msg.status }, 'Presence');
+}
+
+function sendControl(msg) {
+  if (!ws || ws.readyState !== 1) return false;
+  ws.send(JSON.stringify(msg));
+  return true;
 }
 
 function shutdown(signal) {
-  if (stopping) return;
-  stopping = true;
-  clearTimeout(reconnectTimer);
-  console.log(`[agent] Received ${signal}; disconnecting`);
-  if (activeConnection) activeConnection.close(1000, 'Agent shutting down');
+  if (shuttingDown) return;
+  shuttingDown = true;
+  log.info({ signal }, 'Shutting down...');
+
+  cleanup();
+  if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+
+  if (ws && ws.readyState === 1) {
+    sendControl({ type: 'goodbye', name: config.agentName });
+    ws.close(1001, 'Agent shutting down');
+  }
+
   setTimeout(() => process.exit(0), 500).unref();
 }
 
+process.on('SIGTERM', () => shutdown('SIGTERM'));
+process.on('SIGINT', () => shutdown('SIGINT'));
+
 if (require.main === module) {
-  if (!RELAY_TOKEN) console.warn('[agent] AGENT_RELAY_TOKEN is not set. Do not expose an executor on an unauthenticated relay.');
-  console.log(`[agent] Starting "${AGENT_NAME}" in ${WORKSPACE}`);
+  if (!config.agentToken) log.warn('AGENT_RELAY_TOKEN not set');
+  log.info(`Starting "${config.agentName}" in ${config.mcpWorkspace}`);
   connect();
-  process.on('SIGINT', () => shutdown('SIGINT'));
-  process.on('SIGTERM', () => shutdown('SIGTERM'));
 }
 
-module.exports = { TOOLS, workspacePath };
+module.exports = { tools, safePath };

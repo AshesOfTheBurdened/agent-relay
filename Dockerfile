@@ -1,8 +1,10 @@
 FROM node:20-alpine
 RUN addgroup -S app && adduser -S app -G app
 WORKDIR /app
-COPY package.json server.js ./
-COPY websocket.js ./
+COPY package.json ./
+RUN npm install --omit=optional
+COPY server.js agent.js config.js protocol.js logger.js auth.js store.js metrics.js circuit-breaker.js sdk.js ./
+COPY public/ ./public/
 RUN chown -R app:app /app
 USER app
 EXPOSE 8080
