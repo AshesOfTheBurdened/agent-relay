@@ -376,6 +376,52 @@ registerTool('process_info', (args = {}) => {
   }
 });
 
+registerTool('start_process', (args = {}) => {
+  try {
+    const command = typeof args.command === 'string' ? args.command : '';
+    const cwd = args.cwd || process.cwd();
+    const isWin = process.platform === 'win32';
+    if (!command) return { content: [{ type: 'text', text: 'command is required' }], isError: true };
+    const child = spawn(command, [], { cwd, shell: true, detached: true, windowsHide: false, stdio: 'ignore' });
+    child.unref();
+    if (child.pid) {
+      return { content: [{ type: 'text', text: `Started PID ${child.pid}: ${command}` }], pid: child.pid };
+    }
+    return { content: [{ type: 'text', text: `Started: ${command}` }] };
+  } catch (error) {
+    return { content: [{ type: 'text', text: error.message }], isError: true };
+  }
+});
+
+registerTool('open_app', (args = {}) => {
+  try {
+    const app = typeof args.app === 'string' ? args.app : '';
+    const path = typeof args.path === 'string' ? args.path : '';
+    const isWin = process.platform === 'win32';
+    let cmd;
+    if (isWin) {
+      if (path) {
+        cmd = `start "" "${path.replace(/"/g, '\\"')}"`;
+      } else if (app) {
+        cmd = `start "" "${app.replace(/"/g, '\\"')}"`;
+      } else {
+        return { content: [{ type: 'text', text: 'app or path is required' }], isError: true };
+      }
+    } else {
+      if (path) {
+        cmd = path.includes(' ') ? `open "${path}"` : `open ${path}`;
+      } else {
+        cmd = `open -a "${app.replace(/"/g, '\\"')}"`;
+      }
+    }
+    const child = spawn(cmd, [], { shell: true, detached: true, windowsHide: false, stdio: 'ignore' });
+    child.unref();
+    return { content: [{ type: 'text', text: `Launched: ${app || path}` }] };
+  } catch (error) {
+    return { content: [{ type: 'text', text: error.message }], isError: true };
+  }
+});
+
 registerTool('network_info', () => {
   try {
     const interfaces = os.networkInterfaces();
