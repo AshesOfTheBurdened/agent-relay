@@ -7,7 +7,7 @@ const os = require('os');
 const dns = require('dns');
 const net = require('net');
 const crypto = require('crypto');
-const { execSync, execFileSync, spawnSync } = require('child_process');
+const { execSync, execFileSync, spawnSync, spawn } = require('child_process');
 const config = require('./config');
 const { logger, child } = require('./logger');
 
@@ -49,18 +49,25 @@ function registerTool(name, fn) {
   tools[name] = fn;
 }
 
-registerTool('execute_command', (args = {}) => {
+registerTool('execute_command', async (args = {}) => {
   const command = typeof args.command === 'string' ? args.command : '';
   const cwd = safePath(args.cwd || '.');
   const timeout = Math.min(Math.max(1_000, Number(args.timeout) || COMMAND_TIMEOUT), 60_000);
   if (!command) return { content: [{ type: 'text', text: 'command is required' }], isError: true };
-  try {
-    const stdout = execSync(command, { cwd, timeout, encoding: 'utf8', maxBuffer: MAX_OUTPUT_SIZE, windowsHide: true });
-    return { content: [{ type: 'text', text: stdout || '(no output)' }] };
-  } catch (error) {
-    const text = (error.stdout || '') + (error.stderr ? '\n' + error.stderr : '') || error.message;
-    return { content: [{ type: 'text', text: text.slice(0, MAX_OUTPUT_SIZE) }], isError: true };
-  }
+  return new Promise((resolve) => {
+    let stdout = '';
+    let stderr = '';
+    const child = spawn(command, { cwd, shell: true, windowsHide: true, env: { ...process.env, PATH: process.env.PATH } });
+    const timer = setTimeout(() => { child.kill(); resolve({ content: [{ type: 'text', text: stdout + '\n[timed out]' }], isError: true }); }, timeout);
+    child.stdout.on('data', (d) => { stdout += d.toString(); if (stdout.length > MAX_OUTPUT_SIZE) { child.stdout.destroy(); } });
+    child.stderr.on('data', (d) => { stderr += d.toString(); if (stderr.length > MAX_OUTPUT_SIZE) { child.stderr.destroy(); } });
+    child.on('error', (err) => { clearTimeout(timer); resolve({ content: [{ type: 'text', text: err.message }], isError: true }); });
+    child.on('close', (code) => {
+      clearTimeout(timer);
+      const text = stdout.slice(0, MAX_OUTPUT_SIZE) + (stderr ? '\n' + stderr.slice(0, MAX_OUTPUT_SIZE) : '');
+      resolve({ content: [{ type: 'text', text: text || `(exit code ${code})` }], isError: code !== 0 && !stdout });
+    });
+  });
 });
 
 registerTool('read_file', (args = {}) => {
